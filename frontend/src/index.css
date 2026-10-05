@@ -1,0 +1,11 @@
+@import "tailwindcss";
+@theme{--font-sans:'Geist',ui-sans-serif,system-ui,sans-serif;--font-mono:'Geist Mono',ui-monospace,monospace;
+--color-bg:var(--bg);--color-panel:var(--panel);--color-raise:var(--raise);--color-line:var(--line);--color-ink:var(--ink);--color-dim:var(--dim);--color-accent:var(--accent);--color-ok:var(--ok);--color-warn:var(--warn);--color-bad:var(--bad)}
+:root{--bg:#0b0c0f;--panel:#111216;--raise:#17181d;--line:#22242b;--ink:#e8e9ec;--dim:#868b97;--accent:#8b93ff;--ok:#5fd4a0;--warn:#f0b866;--bad:#ef7b7b}
+:root[data-theme=light]{--bg:#f7f7f8;--panel:#fff;--raise:#f0f0f2;--line:#e2e3e7;--ink:#14151a;--dim:#6b7080;--accent:#5b63e6}
+body{background:var(--bg);color:var(--ink);font-family:var(--font-sans);font-size:13.5px;-webkit-font-smoothing:antialiased}
+*{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.35}}.live{animation:pulse-dot 2s infinite}
+@keyframes slide{from{transform:translateX(24px);opacity:0}}.slide{animation:slide .2s ease-out}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+button:focus-visible,textarea:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
