@@ -99,7 +99,7 @@ def agent_status(db) -> dict:
     return dict(status="running" if running else "idle", running=running, last_run_id=done.id if done else None,
                 last_run_at=done.finished_at.isoformat() if done and done.finished_at else None, last=ago(done.finished_at) if done else "never",
                 next_run_at=next_at.isoformat() if next_at else None, next=f"in {mins} min" if mins is not None else "not scheduled",
-                interval_minutes=INTERVAL or None, people=int(t[0]), posts=int(t[1]), opps=int(t[2]), drafts=int(t[3]), recent=recent)
+                interval_minutes=INTERVAL or None, last_status=done.status.lower() if done else None, last_error=done.error if done else None, people=int(t[0]), posts=int(t[1]), opps=int(t[2]), drafts=int(t[3]), recent=recent)
 
 def stats(db) -> dict:
     live = lambda col: col.notin_(DISMISSED)

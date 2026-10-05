@@ -1,4 +1,4 @@
-"""Discovery adapters. Real sources (GitHub, Reddit, ...) implement the same `discover()` later."""
+"""Discovery adapter interface. The real pipeline (pipeline.py) uses LinkedInDiscovery only; MockDiscovery is a dev/test fixture."""
 from dataclasses import dataclass
 
 @dataclass
@@ -13,6 +13,12 @@ class RawCandidate:
     post_text: str | None = None
     post_age_hours: float | None = None
 
+class DiscoveryError(RuntimeError):
+    """A discovery source failed. Propagates so the AgentRun is marked FAILED instead of looking like an empty success."""
+
+class DiscoveryConfigError(DiscoveryError):
+    """A discovery source is not configured (e.g. missing SERPAPI_API_KEY)."""
+
 class DiscoveryAdapter:
     name = "base"
     def discover(self) -> list[RawCandidate]:
@@ -22,7 +28,7 @@ def C(*a, **k):
     return RawCandidate(*a, **k)
 
 class MockDiscovery(DiscoveryAdapter):
-    """Realistic fake candidates so the whole pipeline runs without credentials."""
+    """Dev/test fixture only. NOT used by the real pipeline: never add it to the pipeline's adapter list."""
     name = "mock"
     def discover(self):
         return [
@@ -45,5 +51,3 @@ class MockDiscovery(DiscoveryAdapter):
               "https://www.reddit.com/r/devops/comments/1fz1a8/", "Anyone have a good pattern for caching Docker layers in GitHub Actions?", 40),
             C("Dimitri Volkov", "https://github.com/dvolkov", "SDET", "Orbital Labs", "SDET running the flaky test triage rotation. Python, pytest, test infrastructure.", "mock:github"),
         ]
-
-ADAPTERS: list[DiscoveryAdapter] = [MockDiscovery()]

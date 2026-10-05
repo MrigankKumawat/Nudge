@@ -5,11 +5,13 @@ from datetime import timedelta
 from sqlalchemy import select
 from ..db import SessionLocal, now
 from ..models import Lead, PostOpportunity, Draft, FollowUp, Activity, AgentRun
-from .adapters import ADAPTERS, RawCandidate
+from .adapters import RawCandidate
 from .linkedin_adapter import LinkedInDiscovery
+from .linkedin_discovery import MAX_AGE
 
-# Real source first: with AGENT_MAX_NEW candidates per run, mock data listed before it would starve it. It returns [] without BRAVE_SEARCH_API_KEY.
-ADAPTERS = [LinkedInDiscovery(), *ADAPTERS]
+# Real discovery only (SerpApi -> public LinkedIn posts). MockDiscovery is deliberately NOT here: a real run never creates fake candidates.
+# Without SERPAPI_API_KEY, LinkedInDiscovery raises DiscoveryConfigError and the run is marked FAILED with a clear error.
+ADAPTERS = [LinkedInDiscovery()]
 
 # (key, regex, evidence label, short tag, weight)
 SIGNALS = [
@@ -28,7 +30,7 @@ def ago_h(h: float) -> str:
 
 # ---- research: pull signals out of bio + (fresh) post text -------------------
 def research(c: RawCandidate) -> dict:
-    fresh = bool(c.post_text) and (c.post_age_hours or 0) <= 168
+    fresh = bool(c.post_text) and (c.post_age_hours or 0) <= MAX_AGE.total_seconds() / 3600
     post = (c.post_text or "").lower() if fresh else ""
     text = f"{c.bio} {c.role} {post}".lower()
     sigs = [(l, t, w, k) for k, rx, l, t, w in SIGNALS if re.search(rx, text)]
@@ -46,7 +48,7 @@ def score(c: RawCandidate, r: dict) -> tuple[int, list[str]]:
         if r["question"]:
             s += 6; ev.append("Asked an open question")
     elif c.post_text:
-        ev.append("Post is older than 7 days, not used")
+        ev.append(f"Post is older than {MAX_AGE.days} days, not used")
     if r["promo"]:
         s -= 25; ev.append("Promotional post, not a problem signal")
     if not ev:
@@ -156,8 +158,10 @@ def execute_run(run_id: int) -> None:
         run = db.get(AgentRun, run_id)
         seen = set(db.scalars(select(Lead.profile_url)))
         seen_posts = set(db.scalars(select(PostOpportunity.post_url)))
-        cands = [c for a in ADAPTERS for c in a.discover()
-                 if c.profile_url not in seen and c.post_url not in seen_posts][:max_new]                    # 1. discover
+        found = [(a, a.discover()) for a in ADAPTERS]                                                        # 1. discover
+        for a, _ in found:
+            if getattr(a, "summary", None) and a.summary(): log(db, "agent_run", a.summary())                # funnel counts, visible in the feed
+        cands = [c for _, cs in found for c in cs if c.profile_url not in seen and c.post_url not in seen_posts][:max_new]
         for c in cands:
             time.sleep(delay)
             r = research(c)                                                                                  # 2. research
@@ -175,5 +179,5 @@ def execute_run(run_id: int) -> None:
         run = db.get(AgentRun, run_id); run.status = "FAILED"; run.error = str(e)
     finally:
         run.finished_at = now()
-        log(db, "agent_run", f"Agent run #{run.id} {run.status.lower()}: {run.people_scanned} people, {run.drafts_generated} drafts")
+        log(db, "agent_run", f"Agent run #{run.id} {run.status.lower()}: {run.people_scanned} people, {run.drafts_generated} drafts" + (f" ({run.error})" if run.error else ""))
         db.commit(); db.close()

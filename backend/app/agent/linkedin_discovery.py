@@ -1,15 +1,20 @@
 """Turns normalized SearchResults into recent public LinkedIn post candidates. Pure functions: no I/O, no DB, no scoring.
 
-A post is accepted only with positive evidence that it was published within the last 7 days. We never guess a date:
+A post is accepted only with positive evidence that it was published within the last MAX_AGE (default 7 days, LINKEDIN_MAX_AGE_DAYS to change). We never guess a date:
 unknown or implausible dates are rejected with an explicit reason, not defaulted to "now".
 """
-import re
+import os, re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from .search import SearchResult, is_linkedin_post_url
 
-MAX_AGE = timedelta(days=7)          # inclusive: a post exactly 7 days old is still accepted
+def _max_age_days() -> float:
+    try: d = float(os.getenv("LINKEDIN_MAX_AGE_DAYS", "7"))
+    except ValueError: return 7.0
+    return d if 0 < d <= 365 else 7.0
+
+MAX_AGE = timedelta(days=_max_age_days())   # inclusive: a post exactly MAX_AGE old is still accepted
 FUTURE_TOLERANCE = timedelta(hours=1)  # clock/timezone skew; anything later than this is treated as bad data
 _ID_RE = re.compile(r"(activity|share|ugcpost)[-:](\d{15,})", re.I)
 _EARLIEST = datetime(2003, 1, 1)     # LinkedIn launched in 2003; earlier decoded ids are garbage

@@ -3,19 +3,19 @@
 Returns raw, normalized results only. Never raises: failures come back as SearchResponse.error.
 Config: SERPAPI_API_KEY (read at call time, never hardcoded, never included in errors).
 """
-import html, json, os, re
+import html, json, os, re, ssl
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
+import certifi
 from dotenv import load_dotenv
-import os 
 
-load_dotenv()
+load_dotenv()   # picks up backend/.env so SERPAPI_API_KEY works without exporting it in the shell
 
-API_KEY_ENV = os.getenv("SERPAPI_API_KEY")
+API_KEY_ENV = "SERPAPI_API_KEY"   # the NAME of the env var; the key itself is read at call time in search()
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
 # Freshness codes used by callers (pd | pw | pm | py) -> Google "tbs" date filter.
@@ -46,9 +46,12 @@ class SearchResponse:
 # (url, headers, timeout) -> (status, body). Injectable so tests never touch the network.
 HttpGet = Callable[[str, dict, float], tuple[int, bytes]]
 
+# Verified TLS using certifi's CA bundle: some Python installs (notably on Windows) ship a stale/incomplete system CA store.
+_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+
 def _urllib_get(url: str, headers: dict, timeout: float) -> tuple[int, bytes]:
     try:
-        with urlopen(Request(url, headers=headers), timeout=timeout) as resp:
+        with urlopen(Request(url, headers=headers), timeout=timeout, context=_SSL_CONTEXT) as resp:
             return resp.status, resp.read()
     except HTTPError as e:   # non-2xx still carries a status; let the caller classify it
         return e.code, e.read()
@@ -90,7 +93,7 @@ def _parse_date(value) -> datetime | None:
 class SerpApiSearchProvider(SearchProvider):
     name = "serpapi"
 
-    def __init__(self, api_key: str | None = None, http_get: HttpGet = _urllib_get, timeout: float = 15.0):
+    def __init__(self, api_key: str | None = None, http_get: HttpGet = _urllib_get, timeout: float = 30.0):
         self._api_key, self._http_get, self._timeout = api_key, http_get, timeout
 
     def search(self, query: str, count: int = 10, freshness: str | None = None) -> SearchResponse:
@@ -104,10 +107,16 @@ class SerpApiSearchProvider(SearchProvider):
         tbs = _FRESHNESS_TO_TBS.get(freshness or "")
         if tbs:
             params["tbs"] = tbs
-        try:
-            status, body = self._http_get(f"{SERPAPI_ENDPOINT}?{urlencode(params)}", {"Accept": "application/json"}, self._timeout)
-        except Exception as e:   # never include str(e): urllib errors can echo the URL, which contains the API key
-            return SearchResponse(error=SearchError("network_error", f"Search request failed: {type(e).__name__}"))
+        url = f"{SERPAPI_ENDPOINT}?{urlencode(params)}"
+        for attempt in (1, 2):   # an uncached Google query can be slow: retry once on a network error/timeout before giving up
+            try:
+                status, body = self._http_get(url, {"Accept": "application/json"}, self._timeout)
+                break
+            except Exception as e:   # never include str(e): urllib errors can echo the URL, which contains the API key
+                reason = getattr(e, "reason", None)   # URLError wraps the real cause (timeout, SSL, DNS); its TYPE is safe to show
+                what = type(e).__name__ + (f"({type(reason).__name__})" if reason is not None else "")
+                if attempt == 2:
+                    return SearchResponse(error=SearchError("network_error", f"Search request failed: {what}"))
         if status != 200:
             return SearchResponse(error=SearchError("http_error", f"Search API returned HTTP {status}", status))
         try:
@@ -134,9 +143,6 @@ class SerpApiSearchProvider(SearchProvider):
         if not isinstance(url, str) or urlparse(url).scheme not in ("http", "https") or not title:
             return None
         return SearchResult(title, url, _clean(item.get("snippet")), _parse_date(item.get("date")), self.name)
-
-# Backward-compatible alias so existing imports (e.g. linkedin_adapter.py) keep working unchanged.
-BraveSearchProvider = SerpApiSearchProvider
 
 # ---- URL helper ---------------------------------------------------------------
 _POST_PATH = re.compile(r"^/(posts/[^/]+|feed/update/urn:li:(activity|share|ugcPost):\d+)/?$", re.I)

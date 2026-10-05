@@ -1,4 +1,4 @@
-import asyncio, os
+import asyncio, logging, os
 from contextlib import asynccontextmanager
 from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
@@ -10,6 +10,8 @@ from .db import Base, engine, get_db, now, SessionLocal
 from .models import Lead, PostOpportunity, Draft, Conversation, FollowUp, Activity, AgentRun, DISMISSED
 from . import serializers as S
 from .agent.pipeline import execute_run
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s")   # uvicorn only configures its own loggers; without this INFO from app.agent is invisible
 
 async def scheduler():
     """Optional: set AGENT_INTERVAL_MINUTES=30 to auto-run. Runs only create drafts; nothing is ever sent."""
