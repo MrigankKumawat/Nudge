@@ -8,10 +8,13 @@ from ..models import Lead, PostOpportunity, Draft, FollowUp, Activity, AgentRun
 from .adapters import RawCandidate
 from .linkedin_adapter import LinkedInDiscovery
 from .linkedin_discovery import MAX_AGE
+from .github_adapter import GitHubIssueDiscovery
+from .github_commenter import github_comment_text
 
-# Real discovery only (SerpApi -> public LinkedIn posts). MockDiscovery is deliberately NOT here: a real run never creates fake candidates.
+# Real discovery only (SerpApi -> public LinkedIn posts; GitHub REST issue search). MockDiscovery is deliberately NOT here: a real run never creates fake candidates.
 # Without SERPAPI_API_KEY, LinkedInDiscovery raises DiscoveryConfigError and the run is marked FAILED with a clear error.
-ADAPTERS = [LinkedInDiscovery()]
+# GITHUB_TOKEN is optional for GitHubIssueDiscovery (higher rate limit only). Adapter order matters: candidates are flattened in this order before the AGENT_MAX_NEW cut.
+ADAPTERS = [LinkedInDiscovery(), GitHubIssueDiscovery()]
 
 # (key, regex, evidence label, short tag, weight)
 SIGNALS = [
@@ -106,7 +109,10 @@ def log(db, type_, desc, actor="agent", **meta):
 
 def save(db, c, r, s, ev, action, why) -> bool:
     tags = [t for _, t, _, _ in r["sigs"]]
-    draft_text = comment_text(c) if action == "COMMENT" else dm_text(c, r) if action == "DM" else None
+    if c.source == "github:issue":
+        draft_text = github_comment_text(c) if action == "COMMENT" else None
+    else:
+        draft_text = comment_text(c) if action == "COMMENT" else dm_text(c, r) if action == "DM" else None
     lead = Lead(name=c.name, profile_url=c.profile_url, company=c.company, role=c.role, relevance_score=s, reasons=ev, tags=tags,
                 analysis=why, status="AWAITING_APPROVAL" if draft_text else "NEW", recommended_action=action, source=c.source,
                 last_activity_at=now() - timedelta(hours=c.post_age_hours or 0))
@@ -117,7 +123,7 @@ def save(db, c, r, s, ev, action, why) -> bool:
         post = PostOpportunity(lead_id=lead.id, author=c.name, author_role=c.role, author_company=c.company, author_profile_url=c.profile_url,
                                post_url=c.post_url, content=c.post_text, posted_at=now() - timedelta(hours=c.post_age_hours), relevance_score=s,
                                reasons=tags, why=why, recommended_action=action, source=c.source,
-                               status="AWAITING_APPROVAL" if action == "COMMENT" else "NEW")
+                               status="AWAITING_APPROVAL" if draft_text else "NEW")
         db.add(post); db.flush()
     log(db, "scored", f"Agent scored {c.name} {s}/100", lead_id=lead.id, score=s)
     if draft_text:
