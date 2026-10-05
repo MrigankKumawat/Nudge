@@ -1,18 +1,25 @@
 """Public web search provider layer. Isolated on purpose: no DB, no pipeline, no scoring.
 
 Returns raw, normalized results only. Never raises: failures come back as SearchResponse.error.
-Config: BRAVE_SEARCH_API_KEY (read at call time, never hardcoded, never included in errors).
+Config: SERPAPI_API_KEY (read at call time, never hardcoded, never included in errors).
 """
 import html, json, os, re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
+from dotenv import load_dotenv
+import os 
 
-API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
-BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+load_dotenv()
+
+API_KEY_ENV = os.getenv("SERPAPI_API_KEY")
+SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
+
+# Freshness codes used by callers (pd | pw | pm | py) -> Google "tbs" date filter.
+_FRESHNESS_TO_TBS = {"pd": "qdr:d", "pw": "qdr:w", "pm": "qdr:m", "py": "qdr:y"}
 
 @dataclass
 class SearchResult:
@@ -55,45 +62,67 @@ _TAGS = re.compile(r"<[^>]+>")
 def _clean(text) -> str:
     return html.unescape(_TAGS.sub("", text)).strip() if isinstance(text, str) else ""
 
+_ABS_FORMATS = ("%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y")
+_REL = re.compile(r"^(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago$", re.I)
+_REL_SECONDS = {"minute": 60, "hour": 3600, "day": 86400, "week": 604800, "month": 2592000, "year": 31536000}
+
 def _parse_date(value) -> datetime | None:
-    if not isinstance(value, str) or not value:
+    """Understands ISO strings, 'Mar 3, 2026' and relative forms like '2 days ago'. Returns naive UTC or None."""
+    if not isinstance(value, str) or not value.strip():
         return None
+    value = value.strip()
+    m = _REL.match(value)
+    if m:
+        seconds = int(m.group(1)) * _REL_SECONDS[m.group(2).lower()]
+        return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=seconds)
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
     except ValueError:
-        return None
-    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+        pass
+    for fmt in _ABS_FORMATS:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
 
-class BraveSearchProvider(SearchProvider):
-    name = "brave"
+class SerpApiSearchProvider(SearchProvider):
+    name = "serpapi"
 
-    def __init__(self, api_key: str | None = None, http_get: HttpGet = _urllib_get, timeout: float = 8.0):
+    def __init__(self, api_key: str | None = None, http_get: HttpGet = _urllib_get, timeout: float = 15.0):
         self._api_key, self._http_get, self._timeout = api_key, http_get, timeout
 
     def search(self, query: str, count: int = 10, freshness: str | None = None) -> SearchResponse:
-        """freshness: Brave values pd | pw | pm | py (past day/week/month/year), or None."""
+        """freshness: pd | pw | pm | py (past day/week/month/year), or None. Mapped to Google's tbs=qdr:* filter."""
         key = self._api_key or os.getenv(API_KEY_ENV)
         if not key:
             return SearchResponse(error=SearchError("not_configured", f"{API_KEY_ENV} is not set; web search is disabled."))
         if not query or not query.strip():
             return SearchResponse(error=SearchError("invalid_query", "Query is empty."))
-        params = {"q": query, "count": max(1, min(count, 20))}
-        if freshness:
-            params["freshness"] = freshness
+        params = {"engine": "google", "q": query, "num": max(1, min(count, 20)), "api_key": key}
+        tbs = _FRESHNESS_TO_TBS.get(freshness or "")
+        if tbs:
+            params["tbs"] = tbs
         try:
-            status, body = self._http_get(f"{BRAVE_ENDPOINT}?{urlencode(params)}",
-                                          {"Accept": "application/json", "X-Subscription-Token": key}, self._timeout)
-        except Exception as e:
+            status, body = self._http_get(f"{SERPAPI_ENDPOINT}?{urlencode(params)}", {"Accept": "application/json"}, self._timeout)
+        except Exception as e:   # never include str(e): urllib errors can echo the URL, which contains the API key
             return SearchResponse(error=SearchError("network_error", f"Search request failed: {type(e).__name__}"))
         if status != 200:
             return SearchResponse(error=SearchError("http_error", f"Search API returned HTTP {status}", status))
         try:
-            items = json.loads(body)["web"]["results"]
-            if not isinstance(items, list):
+            data = json.loads(body)
+            if not isinstance(data, dict):
                 raise TypeError
-        except KeyError:
-            items = []   # valid response with no web results (Brave omits "web" when nothing matches)
         except (ValueError, TypeError):
+            return SearchResponse(error=SearchError("invalid_response", "Search API returned an unexpected response."))
+        if data.get("error"):
+            # SerpAPI reports "no results" as a 200 with an error string; anything else is a real failure.
+            if "hasn't returned any results" in str(data["error"]).lower().replace("\u2019", "'"):
+                return SearchResponse(results=[])
+            return SearchResponse(error=SearchError("http_error", "Search API reported an error."))
+        items = data.get("organic_results", [])   # key is omitted when nothing matches
+        if not isinstance(items, list):
             return SearchResponse(error=SearchError("invalid_response", "Search API returned an unexpected response."))
         return SearchResponse(results=[r for r in map(self._normalize, items) if r])
 
@@ -101,10 +130,13 @@ class BraveSearchProvider(SearchProvider):
         """Skips (returns None for) any result without a usable title and http(s) url."""
         if not isinstance(item, dict):
             return None
-        url, title = item.get("url"), _clean(item.get("title"))
+        url, title = item.get("link"), _clean(item.get("title"))
         if not isinstance(url, str) or urlparse(url).scheme not in ("http", "https") or not title:
             return None
-        return SearchResult(title, url, _clean(item.get("description")), _parse_date(item.get("page_age")), self.name)
+        return SearchResult(title, url, _clean(item.get("snippet")), _parse_date(item.get("date")), self.name)
+
+# Backward-compatible alias so existing imports (e.g. linkedin_adapter.py) keep working unchanged.
+BraveSearchProvider = SerpApiSearchProvider
 
 # ---- URL helper ---------------------------------------------------------------
 _POST_PATH = re.compile(r"^/(posts/[^/]+|feed/update/urn:li:(activity|share|ugcPost):\d+)/?$", re.I)
@@ -118,4 +150,4 @@ def is_linkedin_post_url(url: str) -> bool:
     host = (u.hostname or "").lower()
     if u.scheme not in ("http", "https") or not (host == "linkedin.com" or host.endswith(".linkedin.com")):
         return False
-    return bool(_POST_PATH.match(u.path))t
+    return bool(_POST_PATH.match(u.path))
