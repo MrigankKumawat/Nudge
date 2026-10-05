@@ -156,6 +156,17 @@ def assess(c, r) -> tuple[int, list[str], str, str]:
     r["sigs"] = [(label, label, 0, label) for label in a.signals]   # analyzer signals become the lead's tags
     return a.score, list(a.signals), a.recommended_action, a.why
 
+def select_candidates(cands: list, limit: int) -> list:
+    """Best first, then cut to AGENT_MAX_NEW. Uses the score the adapter already computed during discovery (`analysis`, both LinkedIn and GitHub),
+    so the 287th GitHub issue is never researched just because it came first in list order.
+    Actionable (COMMENT/DM) candidates rank ahead of IGNORE ones, so an IGNORE can never take a slot an opportunity could have had; it only fills
+    leftover slots. Stable sort: ties keep discovery order (GitHub: newest update first; LinkedIn: already score-sorted, so its order is unchanged).
+    A candidate with no analysis (dev fixtures only) ranks after scored actionable ones and before IGNOREs."""
+    def rank(c):
+        a = getattr(c, "analysis", None)
+        return (a.recommended_action == "IGNORE", -a.score) if a is not None else (False, 0)
+    return sorted(cands, key=rank)[:limit]
+
 def execute_run(run_id: int) -> None:
     delay = float(os.getenv("AGENT_STEP_DELAY", "0.4"))
     max_new = int(os.getenv("AGENT_MAX_NEW", "4"))
@@ -167,7 +178,9 @@ def execute_run(run_id: int) -> None:
         found = [(a, a.discover()) for a in ADAPTERS]                                                        # 1. discover
         for a, _ in found:
             if getattr(a, "summary", None) and a.summary(): log(db, "agent_run", a.summary())                # funnel counts, visible in the feed
-        cands = [c for _, cs in found for c in cs if c.profile_url not in seen and c.post_url not in seen_posts][:max_new]
+        fresh = [c for _, cs in found for c in cs if c.profile_url not in seen and c.post_url not in seen_posts]
+        cands = select_candidates(fresh, max_new)                                                            # best-scored first, then cut to AGENT_MAX_NEW
+        if len(fresh) > len(cands): log(db, "agent_run", f"Selected the {len(cands)} best-scored of {len(fresh)} new candidates (AGENT_MAX_NEW={max_new})")
         for c in cands:
             time.sleep(delay)
             r = research(c)                                                                                  # 2. research

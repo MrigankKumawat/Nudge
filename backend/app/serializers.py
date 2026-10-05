@@ -37,23 +37,49 @@ def post_draft(db, p: PostOpportunity) -> str:
         text = draft_text_for(db, "lead", p.lead_id)
     return text
 
+GH_SOURCE = "github:issue"
+_GH_NUM = re.compile(r"/issues/(\d+)")
+# Display-only detection of the test framework / CI named in the issue text. Scoring is untouched (github_analyzer.py does that).
+_GH_FRAMEWORKS = (("pytest", r"\bpytest\b|\bconftest\b"), ("pytest-xdist", r"\bxdist\b"), ("Playwright", r"\bplaywright\b"), ("Cypress", r"\bcypress\b"),
+                  ("Jest", r"\bjest\b"), ("Vitest", r"\bvitest\b"), ("Selenium", r"\bselenium\b"), ("Mocha", r"\bmocha\b"), ("JUnit", r"\bjunit\b"),
+                  ("unittest", r"\bunittest\b"), ("RSpec", r"\brspec\b"), ("WebdriverIO", r"\bwebdriverio\b|\bwdio\b"))
+_GH_CI = (("GitHub Actions", r"github actions|\bgha\b"), ("Jenkins", r"\bjenkins\b"), ("GitLab CI", r"gitlab[- ]ci"), ("CircleCI", r"\bcircleci\b"),
+          ("Azure Pipelines", r"azure pipelines?"), ("Buildkite", r"\bbuildkite\b"), ("Travis CI", r"\btravis\b"))
+
+def github_info(p: PostOpportunity) -> dict:
+    """Structured view of a GitHub issue opportunity, derived only from what the pipeline already stored (no GitHub call)."""
+    title, _, body = (p.content or "").partition("\n\n")
+    low = (p.content or "").lower()
+    m = _GH_NUM.search(p.post_url or "")
+    return dict(repository=p.author_company or "", number=int(m.group(1)) if m else None, title=title.strip(), excerpt=body.strip()[:400],
+                author=p.author, author_url=p.author_profile_url, issue_url=p.post_url,
+                frameworks=[n for n, rx in _GH_FRAMEWORKS if re.search(rx, low)], ci=[n for n, rx in _GH_CI if re.search(rx, low)])
+
+def latest_draft(db, target_type: str, target_id: int) -> Draft | None:
+    return db.scalar(select(Draft).where(Draft.target_type == target_type, Draft.target_id == target_id).order_by(Draft.id.desc()).limit(1))
+
 def post_out(db, p: PostOpportunity) -> dict:
-    return dict(id=p.id, lead_id=p.lead_id, url=re.sub(r"^https?://", "", p.post_url), post_url=p.post_url, who=p.author,
+    out = dict(id=p.id, lead_id=p.lead_id, url=re.sub(r"^https?://", "", p.post_url), post_url=p.post_url, who=p.author,
                 role=" · ".join(x for x in (p.author_role, p.author_company) if x), score=p.relevance_score, when=ago(p.posted_at),
                 posted_at=p.posted_at.isoformat(), txt=p.content, why=p.why, sig=p.reasons, act=ACT[p.recommended_action],
-                status=label(p.status), draft=post_draft(db, p), source=p.source)
+                status=label(p.status), draft=post_draft(db, p), source=p.source, github=None, draft_status=None, draft_id=None)
+    if p.source == GH_SOURCE:   # additive: a GitHub draft stays visible (and copyable) after approve/reject, with its state
+        d = latest_draft(db, "post", p.id)
+        out.update(github=github_info(p), draft=d.content if d else "", draft_status=d.status if d else None, draft_id=d.id if d else None)
+    return out
 
 def queue_out(db, d: Draft) -> dict:
     l = db.get(Lead, d.lead_id)
-    ctx, score, post_id = "", l.relevance_score, None
+    ctx, score, post_id, source, issue_url = "", l.relevance_score, None, l.source, None
     if d.target_type == "post":
         p = db.get(PostOpportunity, d.target_id)
-        ctx, score, post_id = f"“{p.content[:90]}{'…' if len(p.content) > 90 else ''}”", p.relevance_score, p.id
+        ctx, score, post_id, source = f"“{p.content[:90]}{'…' if len(p.content) > 90 else ''}”", p.relevance_score, p.id, p.source
+        if p.source == GH_SOURCE: ctx, issue_url = f"“{github_info(p)['title'][:90]}”", p.post_url
     elif d.target_type == "followup":
         f = db.get(FollowUp, d.target_id)
         ctx = f"Last contacted {ago(f.last_contacted_at)}, no reply"
     return dict(id=d.id, kind=ACT[d.action_type], who=l.name, co=l.company or "", ctx=ctx, why=d.why, text=d.content, score=score,
-                lead_id=l.id, post_id=post_id, target_type=d.target_type, status=d.status, created_at=d.created_at.isoformat())
+                lead_id=l.id, post_id=post_id, target_type=d.target_type, status=d.status, created_at=d.created_at.isoformat(), source=source, issue_url=issue_url)
 
 def queue(db, kind: str | None = None) -> list[dict]:
     q = select(Draft).where(Draft.status == "AWAITING_APPROVAL", Draft.target_type.in_(QUEUE_TARGETS))
