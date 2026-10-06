@@ -6,7 +6,7 @@ GITHUB_TOKEN is optional (it only raises the API rate limit). It is sent solely 
 in an error message and never included in summary().
 No scoring and no drafting here: the pipeline's existing research/score/decide steps handle the candidates.
 """
-import json, logging, os, ssl, time
+import json, logging, math, os, re, ssl, time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -54,6 +54,47 @@ QUERIES = (
     'Jest flaky',
 )
 
+# ---- keyword search (manual "Nudge Hunter" flow) ----------------------------------------------------------------
+SEARCH_PER_PAGE = 100        # Search API maximum per page
+SEARCH_POOL = int(os.getenv("GITHUB_SEARCH_POOL", "500"))   # target candidate pool; the API serves at most 1000 results per query, in pages of 100
+SEARCH_MAX_QUERY = 256       # GitHub rejects queries longer than 256 characters (qualifiers included)
+SEARCH_PAGE_GAP = 0.3        # small courtesy gap between pages; the real guard is the x-ratelimit-remaining header
+
+class GitHubSearchError(DiscoveryError):
+    """A keyword search could not return a usable result. `status_code` is the HTTP status the API layer should answer with."""
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message); self.status_code = status_code
+
+_QUALIFIER = re.compile(r"^[-+]?[A-Za-z][\w.-]*:\S+$")   # is:closed, repo:x/y, author:z, updated:>... -- the backend owns all qualifiers
+_OPERATORS = {"AND", "OR", "NOT"}                          # GitHub caps boolean operators per query (422); a plain keyword never needs them
+
+def clean_keyword(raw: str, cutoff: str = "2000-01-01") -> str:
+    """Make a user keyword safe to embed in a GitHub search query. Returns "" when nothing searchable is left.
+    Strips control characters, parentheses, user-supplied qualifiers (so nobody can override is:issue / is:open / updated:) and boolean operators,
+    balances quotes, collapses whitespace and truncates so the whole query stays under the 256-character API limit."""
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", str(raw or "")).replace("(", " ").replace(")", " ")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    if text.count('"') % 2: text = text.replace('"', " ")
+    words = [w for w in text.split() if not _QUALIFIER.match(w) and w not in _OPERATORS]
+    out = " ".join(words)
+    room = SEARCH_MAX_QUERY - len(f" is:issue is:open updated:>={cutoff}") - 2
+    out = out[:room]
+    if out.count('"') % 2: out = out.rsplit('"', 1)[0]   # truncation may have cut a quoted phrase in half
+    return out.strip()
+
+@dataclass
+class SearchResult:
+    keyword: str             # the cleaned keyword actually searched
+    query: str               # full query string sent to GitHub (no token, nothing secret)
+    total_count: int         # GitHub's own total_count for the query (real, not estimated)
+    pages: int               # pages successfully fetched
+    raw: int                 # items received
+    invalid: int             # items dropped as unusable / pull requests
+    bots: int                # items dropped as bot or deleted authors
+    issues: list             # usable GitHubIssue records, deduped by issue URL
+    incomplete: bool = False # GitHub flagged incomplete_results, or a later page failed
+    warning: str = ""        # human-readable note when the pool is smaller than hoped
+
 BOT_MARKERS = ("dependabot", "renovate", "github-actions", "[bot]")   # substring match on the lower-cased login
 DELETED_ACCOUNT = "ghost"                                             # GitHub's placeholder for deleted users: nobody to reach
 
@@ -94,6 +135,13 @@ class GitHubCandidate(RawCandidate):
     """A RawCandidate that also carries the full issue record and analyzer verdict."""
     issue: GitHubIssue | None = None
     analysis: Analysis | None = None
+
+def to_candidate(issue: "GitHubIssue", analysis: Analysis, now: datetime) -> "GitHubCandidate":
+    """One issue -> the RawCandidate shape the pipeline and github_commenter already consume."""
+    return GitHubCandidate(
+        name=issue.author_login[:120], profile_url=issue.author_url, role="", company=issue.repository[:120], bio="", source=SOURCE,
+        post_url=issue.url, post_text=f"{issue.title}\n\n{issue.body}".strip()[:POST_TEXT_MAX],
+        post_age_hours=max(0.0, (now - issue.updated_at).total_seconds() / 3600), issue=issue, analysis=analysis)
 
 # ---- parsing -------------------------------------------------------------------------------------------------
 def _parse_ts(value) -> datetime | None:
@@ -205,20 +253,78 @@ class GitHubIssueDiscovery(DiscoveryAdapter):
                                  + "; check network and GITHUB_TOKEN.")
         return sorted(kept, key=lambda x: (-x.updated_at.timestamp(), x.url))
 
+    def search_keyword(self, keyword: str, pool: int = SEARCH_POOL, sort: str | None = None) -> SearchResult:
+        """Search open issues for ONE user keyword and page through up to `pool` results (API max 1000; 100 per page).
+        sort=None means GitHub's best-match order, so the pool is the most relevant issues in the window, not just the newest.
+        Raises GitHubSearchError when the first page fails; a failure on a later page keeps what was already fetched and sets `warning`."""
+        token = (self._token if self._token is not None else os.getenv(TOKEN_ENV, "")).strip()
+        cutoff = (self.clock() - timedelta(days=self.window_days)).strftime("%Y-%m-%d")
+        kw = clean_keyword(keyword, cutoff)
+        if not kw: raise GitHubSearchError("Enter a keyword to search for (qualifiers like is: or repo: are added by Nudge itself).", 422)
+        query = f"{kw} is:issue is:open updated:>={cutoff}"
+        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": USER_AGENT}
+        if token: headers["Authorization"] = f"Bearer {token}"
+        gap = SEARCH_PAGE_GAP if token else SEARCH_PAGE_GAP * 3
+        pool = max(1, min(int(pool), 1000))
+        seen: set[str] = set()
+        res = SearchResult(keyword=kw, query=query, total_count=0, pages=0, raw=0, invalid=0, bots=0, issues=[])
+        page, last_page = 1, 1
+        while page <= last_page:
+            params = {"q": query, "per_page": SEARCH_PER_PAGE, "page": page, **({"sort": sort, "order": "desc"} if sort else {})}
+            url = f"{ENDPOINT}?{urlencode(params)}"
+            if page > 1: self.sleep(gap)
+            try:
+                status, rh, body = self.http_get(url, headers, self.timeout)
+            except OSError as e:
+                log.warning("GitHub keyword search failed (network: %s) page %d", type(getattr(e, "reason", None) or e).__name__, page)
+                if page == 1: raise GitHubSearchError("Could not reach GitHub. Check your network connection and try again.", 502) from None
+                res.warning, res.incomplete = f"Stopped after page {page - 1}: network error.", True; break
+            if _rate_limited(status, rh, body):
+                reset = rh.get("x-ratelimit-reset", "")
+                wait = max(1, int(reset) - int(self.clock().timestamp())) if reset.isdigit() else None
+                msg = "GitHub search rate limit reached" + (f"; try again in about {wait}s" if wait else "") + ("" if token else ". Set GITHUB_TOKEN in backend/.env for a higher limit") + "."
+                if page == 1: raise GitHubSearchError(msg, 429)
+                res.warning, res.incomplete = f"Rate limited after page {page - 1}; ranked the {len(res.issues)} issues fetched so far.", True; break
+            if status == 401 and token: raise GitHubSearchError("GITHUB_TOKEN was rejected by GitHub (HTTP 401); fix or remove it.", 400)
+            if status == 422: raise GitHubSearchError(f"GitHub could not parse that search ({_message(body) or 'HTTP 422'}). Try simpler keywords.", 422)
+            if status != 200:
+                log.warning("GitHub keyword search failed (HTTP %s %s) page %d", status, _message(body), page)
+                if page == 1: raise GitHubSearchError(f"GitHub search failed (HTTP {status}). Try again in a moment.", 502)
+                res.warning, res.incomplete = f"Stopped after page {page - 1}: GitHub returned HTTP {status}.", True; break
+            try: payload = json.loads(body)
+            except ValueError: payload = None
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                if page == 1: raise GitHubSearchError("GitHub returned an unexpected response. Try again.", 502)
+                res.warning, res.incomplete = f"Stopped after page {page - 1}: unexpected response.", True; break
+            res.pages += 1
+            if page == 1:
+                res.total_count = int(payload.get("total_count") or 0)
+                last_page = math.ceil(min(res.total_count, pool, 1000) / SEARCH_PER_PAGE)
+            res.incomplete = res.incomplete or bool(payload.get("incomplete_results"))
+            log.info("GitHub keyword search page %d returned %d items (total_count=%d)", page, len(items), res.total_count)
+            for item in items:
+                res.raw += 1
+                issue = parse_issue(item, kw)
+                if issue is None: res.invalid += 1; continue
+                if issue.url in seen: continue
+                seen.add(issue.url)
+                if is_bot(item.get("user") or {}) or issue.author_login.lower() == DELETED_ACCOUNT: res.bots += 1; continue
+                res.issues.append(issue)
+            if not items: break
+            if rh.get("x-ratelimit-remaining") == "0" and page < last_page:
+                res.warning, res.incomplete = f"Rate limit exhausted after page {page}; ranked the {len(res.issues)} issues fetched so far.", True; break
+            page += 1
+        return res
+
     def discover(self) -> list[RawCandidate]:
         try:
             issues = self.fetch_issues()
             now = self.clock()
-            
             best: dict[str, GitHubCandidate] = {}   # one candidate per author: the pipeline keys leads by profile_url (unique)
             for issue in issues:                    # newest update first, so the first issue seen per author is that author's most recent
                 if issue.author_url in best: continue
-                text = f"{issue.title}\n\n{issue.body}".strip()[:POST_TEXT_MAX]
-                analysis = analyze_github_issue(issue, now=now)
-                best[issue.author_url] = GitHubCandidate(
-                    name=issue.author_login[:120], profile_url=issue.author_url, role="", company=issue.repository[:120], bio="", source=SOURCE,
-                    post_url=issue.url, post_text=text, post_age_hours=max(0.0, (now - issue.updated_at).total_seconds() / 3600), issue=issue,
-                    analysis=analysis)
+                best[issue.author_url] = to_candidate(issue, analyze_github_issue(issue, now=now), now)
             self.last_report["candidates"] = len(best)
             log.info(self.summary())
             return list(best.values())

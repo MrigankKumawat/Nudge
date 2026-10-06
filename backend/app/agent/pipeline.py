@@ -15,6 +15,9 @@ from .github_commenter import github_comment_text
 # Without SERPAPI_API_KEY, LinkedInDiscovery raises DiscoveryConfigError and the run is marked FAILED with a clear error.
 # GITHUB_TOKEN is optional for GitHubIssueDiscovery (higher rate limit only). Adapter order matters: candidates are flattened in this order before the AGENT_MAX_NEW cut.
 ADAPTERS = [LinkedInDiscovery(), GitHubIssueDiscovery()]
+# A run now targets ONE source (the Nudge Hunter source selector). GitHub keyword hunts do not go through execute_run at all (see github_search.py);
+# "github" here is the legacy fixed-query scan and "all" the old behaviour, both kept reachable via the API only.
+SOURCES = {"linkedin": [ADAPTERS[0]], "github": [ADAPTERS[1]], "all": ADAPTERS}
 
 # (key, regex, evidence label, short tag, weight)
 SIGNALS = [
@@ -167,7 +170,7 @@ def select_candidates(cands: list, limit: int) -> list:
         return (a.recommended_action == "IGNORE", -a.score) if a is not None else (False, 0)
     return sorted(cands, key=rank)[:limit]
 
-def execute_run(run_id: int) -> None:
+def execute_run(run_id: int, source: str = "linkedin") -> None:
     delay = float(os.getenv("AGENT_STEP_DELAY", "0.4"))
     max_new = int(os.getenv("AGENT_MAX_NEW", "4"))
     db = SessionLocal()
@@ -175,7 +178,7 @@ def execute_run(run_id: int) -> None:
         run = db.get(AgentRun, run_id)
         seen = set(db.scalars(select(Lead.profile_url)))
         seen_posts = set(db.scalars(select(PostOpportunity.post_url)))
-        found = [(a, a.discover()) for a in ADAPTERS]                                                        # 1. discover
+        found = [(a, a.discover()) for a in SOURCES[source]]                                                        # 1. discover
         for a, _ in found:
             if getattr(a, "summary", None) and a.summary(): log(db, "agent_run", a.summary())                # funnel counts, visible in the feed
         fresh = [c for _, cs in found for c in cs if c.profile_url not in seen and c.post_url not in seen_posts]

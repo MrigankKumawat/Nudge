@@ -3,13 +3,15 @@ from contextlib import asynccontextmanager
 from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .db import Base, engine, get_db, now, SessionLocal
 from .models import Lead, PostOpportunity, Draft, Conversation, FollowUp, Activity, AgentRun, DISMISSED
 from . import serializers as S
 from .agent.pipeline import execute_run
+from .agent.github_adapter import GitHubSearchError
+from .agent.github_search import search_and_save, DEFAULT_LIMIT
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s")   # uvicorn only configures its own loggers; without this INFO from app.agent is invisible
 
@@ -19,11 +21,11 @@ async def scheduler():
         await asyncio.sleep(max(30, S.INTERVAL * 60))
         await asyncio.to_thread(start_run, "scheduled")
 
-def start_run(trigger: str) -> int | None:
+def start_run(trigger: str, source: str = "linkedin") -> int | None:
     with SessionLocal() as db:
         if db.scalar(select(AgentRun).where(AgentRun.status == "RUNNING")): return None
         run = AgentRun(trigger=trigger); db.add(run); db.commit(); rid = run.id
-    execute_run(rid)
+    execute_run(rid, source)
     return rid
 
 @asynccontextmanager
@@ -200,12 +202,26 @@ def agent_runs(db: Session = Depends(get_db)):
                  drafts_generated=x.drafts_generated, error=x.error) for x in db.scalars(select(AgentRun).order_by(AgentRun.id.desc()).limit(20))]
 
 @r.post("/agent/run", status_code=202)
-def trigger_run(bg: BackgroundTasks, db: Session = Depends(get_db)):
+def trigger_run(bg: BackgroundTasks, source: Literal["linkedin", "github", "all"] = "linkedin", db: Session = Depends(get_db)):
+    """Runs ONE source. Default is linkedin; the GitHub keyword hunt is POST /github/search instead."""
     if db.scalar(select(AgentRun).where(AgentRun.status == "RUNNING")):
         raise HTTPException(409, "An agent run is already in progress")
     run = AgentRun(trigger="manual"); db.add(run); db.commit()
-    bg.add_task(execute_run, run.id)
-    return dict(run_id=run.id, status="RUNNING")
+    bg.add_task(execute_run, run.id, source)
+    return dict(run_id=run.id, status="RUNNING", source=source)
+
+# ---------- GitHub keyword hunt (manual, read-only toward GitHub) ----------
+class GithubSearchBody(BaseModel):
+    keyword: str = Field(min_length=1, max_length=300)
+    limit: int = Field(DEFAULT_LIMIT, ge=1, le=50)
+
+@r.post("/github/search")
+def github_search(body: GithubSearchBody, db: Session = Depends(get_db)):
+    """keyword -> GitHub search (~500 issue pool) -> existing analyzer -> rank -> save/return the top `limit`. Synchronous: takes a few seconds."""
+    try:
+        return search_and_save(db, body.keyword, body.limit)
+    except GitHubSearchError as e:
+        raise HTTPException(e.status_code, str(e))
 
 app.include_router(r)
 
