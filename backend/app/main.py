@@ -40,7 +40,11 @@ async def lifespan(app):
     if task: task.cancel()
 
 app = FastAPI(title="Outreach Agent", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])
+# Browsers may call this API only from these origins (exact match, no wildcard: this app creates and approves drafts).
+# Extra origins, e.g. a Vercel preview URL, go in the CORS_ORIGINS env var on the host, comma-separated, with no code change.
+ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173", "https://nudge-five-self.vercel.app"] \
+    + [o.strip().rstrip("/") for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 from fastapi import APIRouter
 r = APIRouter(prefix="/api")
 
