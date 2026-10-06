@@ -4,6 +4,9 @@
 .env
 .env.*
 !.env.example
+# Public API base URLs only (no secrets): the Vite build needs these committed so Vercel can read them
+!frontend/.env.development
+!frontend/.env.production
 
 # =========================
 # Python

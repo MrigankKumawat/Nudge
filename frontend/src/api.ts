@@ -1,4 +1,6 @@
-const BASE = (import.meta as any).env?.VITE_API_URL ?? 'http://localhost:8000/api'
+// Single source of truth for every backend call. VITE_API_URL comes from frontend/.env.development (local), frontend/.env.production (build) or the
+// Vercel project's Environment Variables, which override the file. The localhost fallback exists for the dev server ONLY, so a production build can never silently target localhost.
+const BASE: string = String((import.meta as any).env.VITE_API_URL || ((import.meta as any).env.DEV ? 'http://localhost:8000/api' : '')).replace(/\/+$/, '')
 // Returns parsed JSON, or null if the backend is unreachable / errors (UI then keeps its built-in mock data).
 export async function api(path: string, method = 'GET', body?: unknown): Promise<any> {
   try {
