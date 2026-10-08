@@ -2,6 +2,7 @@
 
 Read-only. The only request it makes is GET https://api.github.com/search/issues (public data): no HTML scraping, no browser automation,
 no GitHub login, and it never comments, messages, reacts to or otherwise acts on GitHub.
+Reading replies to YOUR comments is a separate read-only module (github_tracker.py); this one only searches.
 GITHUB_TOKEN is optional (it only raises the API rate limit). It is sent solely in the Authorization header and is never logged, never put
 in an error message and never included in summary().
 No scoring and no drafting here: the pipeline's existing research/score/decide steps handle the candidates.
@@ -56,7 +57,7 @@ QUERIES = (
 
 # ---- keyword search (manual "Nudge Hunter" flow) ----------------------------------------------------------------
 SEARCH_PER_PAGE = 100        # Search API maximum per page
-SEARCH_POOL = int(os.getenv("GITHUB_SEARCH_POOL", "500"))   # target candidate pool; the API serves at most 1000 results per query, in pages of 100
+SEARCH_POOL = int(os.getenv("GITHUB_SEARCH_POOL", "1000"))   # target candidate pool; the API serves at most 1000 results per query, in pages of 100
 SEARCH_MAX_QUERY = 256       # GitHub rejects queries longer than 256 characters (qualifiers included)
 SEARCH_PAGE_GAP = 0.3        # small courtesy gap between pages; the real guard is the x-ratelimit-remaining header
 
@@ -114,6 +115,29 @@ def _urllib_get(url: str, headers: dict, timeout: float) -> tuple[int, dict, byt
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+# ---- canonical issue identity --------------------------------------------------------------------------------------------------------------
+# An issue is identified by (source, canonical URL). GitHub's own html_url is already canonical, so rows saved earlier keep matching; this also makes
+# a comment URL (.../issues/570#issuecomment-1), a trailing slash or a ?query collapse to the same issue. Casing is PRESERVED here (that is what gets
+# stored); compare with issue_key(), which lower-cases, because GitHub treats owner/repo case-insensitively.
+_ISSUE_URL = re.compile(r"^https?://(?:www\.)?github\.com/([^/\s?#]+)/([^/\s?#]+)/(issues|pull)/(\d+)", re.I)
+
+def canonical_issue_url(url: str) -> str:
+    """https://github.com/Owner/Repo/issues/570/?x=1#issuecomment-9 -> https://github.com/Owner/Repo/issues/570. Anything that is not a GitHub issue/PR URL is only trimmed."""
+    u = (url or "").strip()
+    m = _ISSUE_URL.match(u)
+    if not m: return u.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    owner, repo, kind, number = m.groups()
+    return f"https://github.com/{owner}/{repo}/{kind.lower()}/{int(number)}"
+
+def issue_key(url: str) -> str:
+    """Case-insensitive identity for dict keys and SQL lookups: lower(post_url) == issue_key(url)."""
+    return canonical_issue_url(url).lower()
+
+def split_issue_url(url: str) -> tuple[str, str, int] | None:
+    """(owner, repo, number) of a GitHub issue URL, or None. Used to build /repos/{owner}/{repo}/issues/{number} API paths."""
+    m = _ISSUE_URL.match((url or "").strip())
+    return (m.group(1), m.group(2), int(m.group(4))) if m else None
+
 @dataclass
 class GitHubIssue:
     url: str                 # html_url of the issue
@@ -167,7 +191,7 @@ def parse_issue(item: dict, query: str) -> GitHubIssue | None:
     created, updated = _parse_ts(item.get("created_at")), _parse_ts(item.get("updated_at"))
     if not (login and url and repo and created and updated and isinstance(number, int)): return None
     return GitHubIssue(
-        url=url, repository=repo, number=number, title=(item.get("title") or "").strip(), body=item.get("body") or "",
+        url=canonical_issue_url(url), repository=repo, number=number, title=(item.get("title") or "").strip(), body=item.get("body") or "",
         author_login=login, author_url=user.get("html_url") or f"https://github.com/{login}", created_at=created, updated_at=updated,
         state=item.get("state") or "open", labels=[l["name"] for l in item.get("labels") or [] if isinstance(l, dict) and l.get("name")],
         comments=int(item.get("comments") or 0), search_query=query)
