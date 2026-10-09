@@ -2,25 +2,6 @@
 
 STRICTLY READ-ONLY toward GitHub. Every request goes through GitHubReader.get(), which can only issue GET; there is no method that comments, replies, reacts,
 opens a page or logs in. No HTML scraping and no OAuth: just the public REST API with the optional GITHUB_TOKEN from backend/.env.
-
-Config (read at call time): GITHUB_USERNAME (required: your identity), GITHUB_TOKEN (optional but practically needed: 60 requests/hour without it),
-GITHUB_TRACK_DAYS (default 30: how far back to look for issues you commented on).
-
-How a check works (check_replies):
-  1. Find issues you commented on, wherever the comment was made (Nudge's Open Issue link, GitHub directly, another tab):
-       - Search API: `commenter:<you> -author:<you> is:issue updated:>=<cutoff>` (open AND closed issues; up to 300), plus
-       - issues Nudge already knows: open GitHub conversations and approved/contacted opportunities (the search index lags by minutes).
-  2. For each issue, GET /repos/{owner}/{repo}/issues/{number}/comments (only comments changed since the last check, for issues already tracked).
-  3. Keep YOUR comments, and other people's comments written AFTER your first one. Earlier comments are context only and are never stored. Bots are skipped.
-  4. Each comment is stored once: (source, external_id = GitHub comment id) is unique. A comment already stored is ignored, so repeat checks create no duplicate
-     messages, no duplicate Activity rows and no new unread notifications. Only a genuinely new row can change unread / status.
-  5. The issue is linked to its existing opportunity / lead. If Nudge has none (you commented on it outside Nudge), the minimum is created: one Lead (reused by
-     GitHub profile URL, never duplicated) and one PostOpportunity. Nothing is ever fabricated: every message is a real GitHub comment.
-
-Conversation states (GitHub conversations): WAITING_FOR_THEM (your comment is the latest), NEW_REPLY (someone replied and you have not read / answered it),
-WAITING_FOR_ME (you marked it read), CLOSED (set by you; reopens on any new comment).
-Lead / post status only ever moves FORWARD: NEW / AWAITING_APPROVAL / APPROVED -> CONTACTED when your comment is found, CONTACTED -> REPLIED when the lead
-(the issue author) replies. IGNORED / NOT_RELEVANT / INTERESTED / NOT_INTERESTED are never touched, and drafts are never touched.
 """
 import json, logging, os, re, threading, time
 from dataclasses import dataclass, field
@@ -122,7 +103,6 @@ def _config() -> tuple[str, str, int]:
     except ValueError: days = DEFAULT_TRACK_DAYS
     return username, os.getenv(TOKEN_ENV, "").strip(), days
 
-# ---- 1. which issues to look at ------------------------------------------------------------------------------------------------------------
 def _gather(db: Session, reader: GitHubReader, ctx: Ctx) -> dict[str, Target]:
     targets: dict[str, Target] = {}
     cutoff = db_now() - timedelta(days=ctx.days)
@@ -160,7 +140,6 @@ def _gather(db: Session, reader: GitHubReader, ctx: Ctx) -> dict[str, Target]:
         if sp and key not in targets and key not in closed: targets[key] = Target(canonical_issue_url(p.post_url), *sp)
     return targets
 
-# ---- 2. read one issue's comments ----------------------------------------------------------------------------------------------------------
 def _fetch_comments(reader: GitHubReader, tgt: Target, since: datetime | None, ctx: Ctx) -> list[dict] | None:
     out: list[dict] = []
     for page in range(1, MAX_COMMENT_PAGES + 1):
@@ -178,7 +157,6 @@ def _fetch_issue(reader: GitHubReader, tgt: Target) -> GitHubIssue | None:
     status, rh, data = reader.get(f"/repos/{tgt.owner}/{tgt.repo}/issues/{tgt.number}")
     return parse_issue(data, "reply tracking") if status == 200 and isinstance(data, dict) else None
 
-# ---- 3. link to / create the lead + opportunity ---------------------------------------------------------------------------------------------
 def _lead_login(lead: Lead) -> str:
     return (lead.profile_url or "").rstrip("/").rsplit("/", 1)[-1].lower()
 
@@ -186,7 +164,6 @@ def _find_convo(db: Session, url: str) -> Conversation | None:
     return db.scalar(select(Conversation).where(func.lower(Conversation.issue_url) == issue_key(url)))
 
 def _lead_for(db: Session, name: str, profile_url: str, repo: str, at: datetime) -> Lead:
-    """One person = one lead, keyed by GitHub profile URL (leads.profile_url is unique)."""
     lead = db.scalar(select(Lead).where(Lead.profile_url == profile_url))
     if lead is None:
         lead = Lead(name=name[:120], profile_url=profile_url, company=repo[:120], role="", relevance_score=0, reasons=[], tags=[], status="NEW", recommended_action="COMMENT",
@@ -212,7 +189,6 @@ def _post_and_lead(db: Session, reader: GitHubReader, tgt: Target) -> tuple[Post
         post.lead_id = lead.id
     return post, lead
 
-# ---- 4. ingest one issue -------------------------------------------------------------------------------------------------------------------
 def _process(db: Session, reader: GitHubReader, tgt: Target, ctx: Ctx) -> None:
     convo = _find_convo(db, tgt.url)
     started = db_now()
@@ -227,11 +203,11 @@ def _process(db: Session, reader: GitHubReader, tgt: Target, ctx: Ctx) -> None:
         login, cid = user.get("login") or "ghost", c.get("id")
         if not isinstance(cid, int) or created is None: continue
         mine = login.lower() == ctx.username.lower()
-        if not mine and is_bot(user): continue                                  # automation noise is never a reply
+        if not mine and is_bot(user): continue
         body = c.get("body") or ""
         parsed.append(dict(id=cid, login=login, mine=mine, created=_naive(created), body=body, url=c.get("html_url"), mention=(not mine) and bool(ctx.mention.search(body))))
     mine_keys = [(m.created_at, int(m.external_id)) for m in rows if m.is_from_me] + [(p["created"], p["id"]) for p in parsed if p["mine"]]
-    if not mine_keys:                                                           # you have not commented here: nothing to track
+    if not mine_keys:
         if convo: convo.last_checked_at = started; db.commit()
         return
     first_mine = min(mine_keys)
@@ -259,7 +235,7 @@ def _process(db: Session, reader: GitHubReader, tgt: Target, ctx: Ctx) -> None:
                 db.add(Activity(type="followed_up", actor="you", timestamp=p["created"], meta=meta, description=f"You replied to {prev_login} on {tgt.ref}"))
             else:
                 db.add(Activity(type="comment_detected", actor="you", timestamp=p["created"], meta=meta, description=f"You commented on {tgt.ref}"))
-            if lead.status in FORWARD_FROM: lead.status = "CONTACTED"            # forward only; dismissed / interested / replied are never touched
+            if lead.status in FORWARD_FROM: lead.status = "CONTACTED"
             if post.status in FORWARD_FROM: post.status = "CONTACTED"
             lead.last_contacted_at = max(lead.last_contacted_at or p["created"], p["created"])
         else:
@@ -274,30 +250,28 @@ def _process(db: Session, reader: GitHubReader, tgt: Target, ctx: Ctx) -> None:
             if p["mention"]: ctx.new_mentions += 1
         lead.last_activity_at = max(lead.last_activity_at or p["created"], p["created"])
         prev_from_me, prev_login = p["mine"], p["login"]
-    db.flush()                                                                  # a duplicate comment id would fail here (UNIQUE), before anything is committed
+    db.flush()
     last = db.scalar(select(ConversationMessage).where(ConversationMessage.conversation_id == convo.id).order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc()).limit(1))
     convo.last_message_at, convo.last_message_author, convo.last_message_from_me = last.created_at, last.author_username, last.is_from_me
-    if last.is_from_me:                                                         # you have the last word: nothing to read or answer
+    if last.is_from_me:
         convo.status, convo.unread = "WAITING_FOR_THEM", False
-    elif new_other:                                                             # someone replied and you have not answered
+    elif new_other:
         convo.status, convo.unread = "NEW_REPLY", True
     convo.last_checked_at = started
     db.commit()
     ctx.new_mine += new_mine; ctx.new_replies += new_other; ctx.touched.add(convo.id)
 
-# ---- public API ---------------------------------------------------------------------------------------------------------------------------
 def unread_count(db: Session) -> int:
     return db.scalar(select(func.count()).select_from(Conversation).where(Conversation.source == SOURCE, Conversation.unread.is_(True))) or 0
 
 def check_replies(db: Session, reader: GitHubReader | None = None) -> dict:
-    """Manual 'Check for replies'. Persists everything it finds (one commit per issue, so a rate limit midway keeps the progress) and returns what was NEW."""
     username, token, days = _config()
     if not _LOCK.acquire(blocking=False):
         raise TrackerError("A reply check is already running.", 409)
     try:
         reader = reader or GitHubReader(token)
         ctx = Ctx(username=username, days=days, mention=re.compile(rf"(?<![\w-])@{re.escape(username)}(?![\w-])", re.I))
-        if token:                                                               # sanity check only: warn if the token belongs to someone else
+        if token:
             try:
                 status, _, me = reader.get("/user")
                 if status == 200 and isinstance(me, dict) and (me.get("login") or "").lower() != username.lower():
@@ -322,14 +296,12 @@ def check_replies(db: Session, reader: GitHubReader | None = None) -> dict:
         _LOCK.release()
 
 def mark_read(db: Session, convo: Conversation) -> Conversation:
-    """You have read it: clears unread; a NEW_REPLY becomes WAITING_FOR_ME. Idempotent."""
     convo.unread = False
     if convo.status == "NEW_REPLY": convo.status = "WAITING_FOR_ME"
     db.commit()
     return convo
 
 def set_status(db: Session, convo: Conversation, status: str) -> Conversation:
-    """Manual state change. CLOSED (done with it) and the two waiting states are allowed; NEW_REPLY only comes from a real new comment."""
     if status not in ("CLOSED", "WAITING_FOR_ME", "WAITING_FOR_THEM"):
         raise TrackerError("Status must be CLOSED, WAITING_FOR_ME or WAITING_FOR_THEM.", 422)
     convo.status = status

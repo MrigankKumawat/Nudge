@@ -6,12 +6,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from .db import Base, engine, get_db, now, SessionLocal
+
+from .db import Base, engine, get_db, now, SessionLocal, init_db
 from .models import Lead, PostOpportunity, Draft, Conversation, FollowUp, Activity, AgentRun, DISMISSED
 from . import serializers as S
 from .agent.pipeline import execute_run
 from .agent.github_adapter import GitHubSearchError
 from .agent.github_search import search_and_save, DEFAULT_LIMIT
+
+# Import new sub-routers
+from .routers import conversations as conversations_router
+from .routers import activity as activity_router
+from .routers import scans as scans_router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s")   # uvicorn only configures its own loggers; without this INFO from app.agent is invisible
 
@@ -30,6 +36,7 @@ def start_run(trigger: str, source: str = "linkedin") -> int | None:
 
 @asynccontextmanager
 async def lifespan(app):
+    init_db()  # Run migrations, schema updates, and startup cleanup
     Base.metadata.create_all(engine)
     with SessionLocal() as db:   # a server restart mid-run leaves a stale RUNNING row
         for r in db.scalars(select(AgentRun).where(AgentRun.status == "RUNNING")):
@@ -40,11 +47,12 @@ async def lifespan(app):
     if task: task.cancel()
 
 app = FastAPI(title="Outreach Agent", lifespan=lifespan)
+
 # Browsers may call this API only from these origins (exact match, no wildcard: this app creates and approves drafts).
-# Extra origins, e.g. a Vercel preview URL, go in the CORS_ORIGINS env var on the host, comma-separated, with no code change.
 ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173", "https://nudge-five-self.vercel.app"] \
     + [o.strip().rstrip("/") for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+
 from fastapi import APIRouter
 r = APIRouter(prefix="/api")
 
@@ -175,24 +183,9 @@ def not_relevant(id: int, db: Session = Depends(get_db)):
     return resolve(db, pending_draft(db, id), "NOT_RELEVANT", "marked not relevant:")
 
 # ---------- conversations / follow-ups / activity ----------
-@r.get("/conversations")
-def conversations(status: str | None = None, db: Session = Depends(get_db)):
-    stmt = select(Conversation).order_by(Conversation.updated_at.desc())
-    if status: stmt = stmt.where(Conversation.status == status.upper().replace(" ", "_"))
-    return [S.convo_out(db, c) for c in db.scalars(stmt)]
-
-@r.get("/conversations/{id}")
-def conversation(id: int, db: Session = Depends(get_db)):
-    return S.convo_out(db, get_or_404(db, Conversation, id))
-
 @r.get("/followups")
 def followups(db: Session = Depends(get_db)):
     return [dict(lead=n, last_contacted=w, urgency=u, draft=t, draft_id=i) for n, w, u, t, i in S.followups(db)]
-
-@r.get("/activity")
-def activity(limit: int = Query(50, le=200), db: Session = Depends(get_db)):
-    return [dict(id=a.id, type=a.type, actor=a.actor, description=a.description, timestamp=a.timestamp.isoformat(), when=S.ago(a.timestamp), meta=a.meta)
-            for a in db.scalars(select(Activity).order_by(Activity.id.desc()).limit(limit))]
 
 # ---------- agent ----------
 @r.get("/agent/status")
@@ -227,7 +220,13 @@ def github_search(body: GithubSearchBody, db: Session = Depends(get_db)):
     except GitHubSearchError as e:
         raise HTTPException(e.status_code, str(e))
 
+# Include legacy base router
 app.include_router(r)
+
+# Include dedicated module routers
+app.include_router(scans_router.router)
+app.include_router(conversations_router.router)
+app.include_router(activity_router.router)
 
 @app.get("/")
 def root():

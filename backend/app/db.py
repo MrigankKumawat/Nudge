@@ -81,3 +81,19 @@ def migrate() -> None:
     with engine.begin() as conn:                             # indexes: safe to repeat, and only for tables that already exist (a new table gets its index from create_all)
         for name, table, col in UNIQUE_INDEXES:
             if table in tables: conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table}({col})"))
+
+
+def init_db() -> None:
+    """Runs idempotent schema migrations, builds any missing tables, and cleans up stale scan states."""
+    migrate()
+    Base.metadata.create_all(bind=engine)
+    
+    # Mark any scan stuck in 'RUNNING' from a previous crash as 'FAILED'
+    with SessionLocal() as session:
+        try:
+            session.execute(
+                text("UPDATE scans SET status = 'FAILED', error = 'server restarted' WHERE status = 'RUNNING'")
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
