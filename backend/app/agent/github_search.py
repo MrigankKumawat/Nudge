@@ -19,7 +19,7 @@ from datetime import timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from ..db import now as db_now
-from ..models import Lead, PostOpportunity, Draft, Activity, Scan, DISMISSED
+from ..models import Lead, PostOpportunity, Draft, Activity, Scan, Conversation, IssueOutreach, DISMISSED
 from .. import serializers as S
 from .github_adapter import GitHubIssueDiscovery, GitHubIssue, GitHubSearchError, SOURCE, to_candidate, issue_key
 from .github_analyzer import Analysis, analyze_github_issue
@@ -27,6 +27,8 @@ from .github_commenter import github_comment_text
 
 log = logging.getLogger(__name__)
 DEFAULT_LIMIT = 30
+try: FRESH_HOURS = float(os.getenv("GITHUB_FRESH_HOURS", "48"))   # recency window of the fresh outreach queue, measured on GitHub's own `updated_at`; 0 = no window (historical research)
+except ValueError: FRESH_HOURS = 48.0
 STALE_SCAN = timedelta(minutes=15)   # a RUNNING scan older than this is treated as dead (crashed server / abandoned request) and no longer blocks a new one
 
 def rank(scored: list[tuple[GitHubIssue, Analysis]]) -> list[tuple[GitHubIssue, Analysis]]:
@@ -44,6 +46,21 @@ def _existing_posts(db: Session, urls: list[str]) -> dict[str, PostOpportunity]:
     for i in range(0, len(keys), 400):   # stay well under SQLite's bound-variable limit
         for p in db.scalars(select(PostOpportunity).where(func.lower(PostOpportunity.post_url).in_(keys[i:i + 400]))):
             out[issue_key(p.post_url)] = p
+    return out
+
+def contacted_keys(db: Session, urls: list[str]) -> set[str]:
+    """issue_key()s among `urls` that you have already contacted, read from the database (never from this scan's own results), so the answer survives
+    restarts and does not depend on which keyword found the issue. An issue counts as contacted when ANY of these exists:
+      - an issue_outreach row (the 'Mark as commented' action),
+      - a saved post for it with status CONTACTED (set by reply tracking when it found your comment),
+      - a GitHub conversation for it (reply tracking only creates one after finding a comment by you)."""
+    keys = list({issue_key(u) for u in urls})
+    out: set[str] = set()
+    for i in range(0, len(keys), 400):   # stay well under SQLite's bound-variable limit
+        chunk = keys[i:i + 400]
+        out.update(db.scalars(select(IssueOutreach.issue_key).where(IssueOutreach.issue_key.in_(chunk))))
+        out.update(issue_key(u) for u in db.scalars(select(PostOpportunity.post_url).where(func.lower(PostOpportunity.post_url).in_(chunk), PostOpportunity.status == "CONTACTED")))
+        out.update(issue_key(u) for u in db.scalars(select(Conversation.issue_url).where(func.lower(Conversation.issue_url).in_(chunk))))
     return out
 
 def _has_draft(db: Session, post_id: int) -> bool:
@@ -101,24 +118,39 @@ def _fail_scan(db: Session, scan_id: int, keyword: str, err: Exception) -> None:
     except Exception:
         db.rollback(); log.exception("Could not record failed scan %s", scan_id)
 
-def search_and_save(db: Session, keyword: str, limit: int = DEFAULT_LIMIT, adapter: GitHubIssueDiscovery | None = None) -> dict:
+def search_and_save(db: Session, keyword: str, limit: int = DEFAULT_LIMIT, adapter: GitHubIssueDiscovery | None = None, fresh_hours: float | None = None) -> dict:
     """Run one manual keyword hunt and save it as the new current scan. Raises GitHubSearchError (with .status_code) when GitHub cannot be searched or
-    another scan is running. On any failure the scan is recorded as FAILED, no opportunity data is written, and the previous scan stays current."""
+    another scan is running. On any failure the scan is recorded as FAILED, no opportunity data is written, and the previous scan stays current.
+    `fresh_hours`: only issues GitHub last updated within this many hours qualify (None = GITHUB_FRESH_HOURS, default 48; 0 = no window, i.e. historical research)."""
     adapter = adapter or GitHubIssueDiscovery()
+    fresh_hours = FRESH_HOURS if fresh_hours is None else float(fresh_hours)
     scan_id = _claim_scan(db, keyword, limit)
     try:
-        res = adapter.search_keyword(keyword)                                               # 1-2. fetch the pool (raises on failure, before any opportunity is written)
         now = adapter.clock()
-        scored = [(i, analyze_github_issue(i, now=now)) for i in res.issues]                # 5-6. existing analyzer scores every issue in the pool (issues are already URL-deduped)
-        ranked = rank(scored)                                                               # 7. rank
+        since = now - timedelta(hours=fresh_hours) if fresh_hours > 0 else None
+        res = adapter.search_keyword(keyword, updated_since=since)                          # 1-2. fetch the pool (raises on failure, before any opportunity is written)
+        # Every stage below counts only what survived the stage before it, so the counts saved on the scan add up exactly (checked after the loop).
+        unique = res.issues                                                                 # 2-3. canonical URL + duplicate removal already done by the adapter (res.duplicates counts the repeats)
+        contacted = contacted_keys(db, [i.url for i in unique])                             # 4. already-contacted suppression: BEFORE scoring, ranking and the one-per-author cut
+        pool = [i for i in unique if issue_key(i.url) not in contacted]
+        n_contacted = len(unique) - len(pool)
+        if since is not None:                                                               # 5. freshness: GitHub's real updated_at, never the time Nudge discovered the issue
+            fresh = [i for i in pool if i.updated_at >= since]
+            n_too_old, pool = len(pool) - len(fresh), fresh
+        else: n_too_old = 0
+        humans = [i for i in pool if not i.author_is_bot]                                   # 6. bot / deleted-account filter (after contacted + freshness, so each count stays honest)
+        n_bots, pool = len(pool) - len(humans), humans
+        scored = [(i, analyze_github_issue(i, now=now)) for i in pool]                      # 7. existing analyzer scores every remaining issue (URL-deduped, not contacted, fresh, human)
+        ranked = rank(scored)                                                               # 9. rank
         actionable = [t for t in ranked if t[1].recommended_action != "IGNORE"]             # IGNORE-class issues are never presented as outreach opportunities
+        n_irrelevant = len(scored) - len(actionable)
         existing = _existing_posts(db, [i.url for i, _ in actionable])
         picked: list[PostOpportunity] = []
         authors: set[str] = set()
-        hidden = 0
-        for issue, an in actionable:                                                        # 8. select AFTER analysis + ranking (never the first N raw results)
-            if len(picked) >= limit: break
-            if issue.author_url in authors: continue                                        # one outreach target per person
+        hidden = same_author = over_limit = 0
+        for issue, an in actionable:                                                        # 8-10. one per author, then the top N: selected AFTER analysis + ranking (never the first N raw results)
+            if len(picked) >= limit: over_limit += 1; continue                              # eligible, but past the top-N cut
+            if issue.author_url in authors: same_author += 1; continue                      # one outreach target per person
             old = existing.get(issue_key(issue.url))
             if old is not None and old.status in DISMISSED:
                 hidden += 1; continue                                                       # you already dismissed this one
@@ -130,9 +162,15 @@ def search_and_save(db: Session, keyword: str, limit: int = DEFAULT_LIMIT, adapt
         scan = db.get(Scan, scan_id)                                                        # fill the scan and flip it to COMPLETED in the SAME transaction as the saves above
         scan.keyword, scan.query = res.keyword[:300], res.query[:400]
         scan.status, scan.completed_at = "COMPLETED", db_now()
-        scan.matching_count, scan.fetched_count, scan.unique_count, scan.analyzed_count = res.total_count, res.raw, len(res.issues), len(scored)
+        scan.matching_count, scan.fetched_count, scan.unique_count, scan.analyzed_count = res.total_count, res.raw, len(unique), len(scored)
         scan.comment_count, scan.displayed_count, scan.hidden_dismissed = len(actionable), len(picked), hidden
-        scan.pages, scan.skipped_unusable, scan.skipped_bots = res.pages, res.invalid, res.bots
+        scan.pages, scan.skipped_unusable, scan.skipped_bots = res.pages, res.invalid, n_bots
+        scan.duplicate_count, scan.contacted_count, scan.too_old_count, scan.irrelevant_count = res.duplicates, n_contacted, n_too_old, n_irrelevant
+        scan.same_author_count, scan.over_limit_count, scan.fresh_hours = same_author, over_limit, fresh_hours or None
+        for what, ok in (("raw", res.raw == res.invalid + res.duplicates + len(unique)),    # the stage counts must add up; if they ever do not, say so loudly instead of showing wrong numbers quietly
+                         ("unique", len(unique) == n_contacted + n_too_old + n_bots + n_irrelevant + len(actionable)),
+                         ("eligible", len(actionable) == len(picked) + same_author + hidden + over_limit)):
+            if not ok: log.error("GitHub scan #%d: the %s stage counts do not add up (a bug in the funnel counting)", scan_id, what)
         scan.incomplete, scan.authenticated, scan.warning = bool(res.incomplete), authed, res.warning or None
         scan.result_post_ids = [p.id for p in picked]
         db.add(Activity(type="github_search", actor="you", meta={"scan_id": scan_id, "keyword": res.keyword, "total_count": res.total_count, "fetched": res.raw, "shown": len(picked)},
@@ -142,5 +180,6 @@ def search_and_save(db: Session, keyword: str, limit: int = DEFAULT_LIMIT, adapt
         db.rollback()
         _fail_scan(db, scan_id, keyword, e)
         raise
-    log.info("GitHub scan #%d %r: total=%d fetched=%d unique=%d analyzed=%d actionable=%d shown=%d", scan_id, res.keyword, res.total_count, res.raw, len(res.issues), len(scored), len(actionable), len(picked))
+    log.info("GitHub scan #%d %r: total=%d fetched=%d unique=%d contacted=%d too_old=%d (window=%sh) bots=%d irrelevant=%d eligible=%d same_author=%d dismissed=%d over_limit=%d shown=%d",
+             scan_id, res.keyword, res.total_count, res.raw, len(unique), n_contacted, n_too_old, fresh_hours or "none", n_bots, n_irrelevant, len(actionable), same_author, hidden, over_limit, len(picked))
     return S.scan_out(db, scan)

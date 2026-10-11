@@ -95,6 +95,7 @@ class SearchResult:
     issues: list             # usable GitHubIssue records, deduped by issue URL
     incomplete: bool = False # GitHub flagged incomplete_results, or a later page failed
     warning: str = ""        # human-readable note when the pool is smaller than hoped
+    duplicates: int = 0      # repeats of an issue URL already in `issues` (dropped silently before; now counted)
 
 BOT_MARKERS = ("dependabot", "renovate", "github-actions", "[bot]")   # substring match on the lower-cased login
 DELETED_ACCOUNT = "ghost"                                             # GitHub's placeholder for deleted users: nobody to reach
@@ -153,6 +154,7 @@ class GitHubIssue:
     labels: list[str]
     comments: int
     search_query: str        # the query term that first found this issue
+    author_is_bot: bool = False   # bot or deleted account, set by parse_issue. search_keyword keeps these (flagged) so github_search can drop them at the right stage and count them
 
 @dataclass
 class GitHubCandidate(RawCandidate):
@@ -194,7 +196,7 @@ def parse_issue(item: dict, query: str) -> GitHubIssue | None:
         url=canonical_issue_url(url), repository=repo, number=number, title=(item.get("title") or "").strip(), body=item.get("body") or "",
         author_login=login, author_url=user.get("html_url") or f"https://github.com/{login}", created_at=created, updated_at=updated,
         state=item.get("state") or "open", labels=[l["name"] for l in item.get("labels") or [] if isinstance(l, dict) and l.get("name")],
-        comments=int(item.get("comments") or 0), search_query=query)
+        comments=int(item.get("comments") or 0), search_query=query, author_is_bot=is_bot(user) or login.lower() == DELETED_ACCOUNT)
 
 def _rate_limited(status: int, headers: dict, body: bytes) -> bool:
     if status == 429: return True
@@ -277,12 +279,15 @@ class GitHubIssueDiscovery(DiscoveryAdapter):
                                  + "; check network and GITHUB_TOKEN.")
         return sorted(kept, key=lambda x: (-x.updated_at.timestamp(), x.url))
 
-    def search_keyword(self, keyword: str, pool: int = SEARCH_POOL, sort: str | None = None) -> SearchResult:
+    def search_keyword(self, keyword: str, pool: int = SEARCH_POOL, sort: str | None = None, updated_since: datetime | None = None) -> SearchResult:
         """Search open issues for ONE user keyword and page through up to `pool` results (API max 1000; 100 per page).
         sort=None means GitHub's best-match order, so the pool is the most relevant issues in the window, not just the newest.
+        `updated_since` (timezone-aware) narrows the search to issues GitHub itself says were updated at or after that exact moment (the real `updated_at`),
+        so a fresh-queue search spends its 1,000-result pool on fresh issues instead of on stale ones. Without it the usual window_days (date granularity) applies.
         Raises GitHubSearchError when the first page fails; a failure on a later page keeps what was already fetched and sets `warning`."""
         token = (self._token if self._token is not None else os.getenv(TOKEN_ENV, "")).strip()
-        cutoff = (self.clock() - timedelta(days=self.window_days)).strftime("%Y-%m-%d")
+        if updated_since is not None: cutoff = updated_since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else: cutoff = (self.clock() - timedelta(days=self.window_days)).strftime("%Y-%m-%d")
         kw = clean_keyword(keyword, cutoff)
         if not kw: raise GitHubSearchError("Enter a keyword to search for (qualifiers like is: or repo: are added by Nudge itself).", 422)
         query = f"{kw} is:issue is:open updated:>={cutoff}"
@@ -331,9 +336,9 @@ class GitHubIssueDiscovery(DiscoveryAdapter):
                 res.raw += 1
                 issue = parse_issue(item, kw)
                 if issue is None: res.invalid += 1; continue
-                if issue.url in seen: continue
+                if issue.url in seen: res.duplicates += 1; continue
                 seen.add(issue.url)
-                if is_bot(item.get("user") or {}) or issue.author_login.lower() == DELETED_ACCOUNT: res.bots += 1; continue
+                if issue.author_is_bot: res.bots += 1                  # kept, flagged: github_search drops bots AFTER the contacted and freshness stages, so each count stays honest
                 res.issues.append(issue)
             if not items: break
             if rh.get("x-ratelimit-remaining") == "0" and page < last_page:

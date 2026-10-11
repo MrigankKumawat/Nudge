@@ -123,7 +123,7 @@ class Scan(Base):
     result_limit: Mapped[int] = mapped_column(default=30)
     matching_count: Mapped[int] = mapped_column(default=0)           # GitHub's total_count
     fetched_count: Mapped[int] = mapped_column(default=0)            # raw items received
-    unique_count: Mapped[int] = mapped_column(default=0)             # usable issues after URL dedupe / bot / PR filtering
+    unique_count: Mapped[int] = mapped_column(default=0)             # unique usable issues after URL dedupe (bots still included; they are counted at their own stage). Scans saved before the stage counts existed counted it after bot filtering.
     analyzed_count: Mapped[int] = mapped_column(default=0)
     comment_count: Mapped[int] = mapped_column(default=0)            # COMMENT-worthy
     displayed_count: Mapped[int] = mapped_column(default=0)          # after author dedupe + top-N cut
@@ -136,6 +136,34 @@ class Scan(Base):
     warning: Mapped[str | None] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text)
     result_post_ids: Mapped[list] = mapped_column(JSON, default=list)   # PostOpportunity ids, best first
+    # ---- per-stage pipeline counts (new). NULL = the scan ran before these were tracked: they are never guessed, and the UI says so. ----
+    # Every stage counts only what survived the stage before it, so the numbers add up exactly:
+    #   unique_count = contacted_count + too_old_count + skipped_bots + irrelevant_count + comment_count            (comment_count = fresh eligible)
+    #   comment_count = displayed_count + same_author_count + hidden_dismissed + over_limit_count
+    duplicate_count: Mapped[int | None] = mapped_column()            # same issue URL returned again (by a later page of the same search)
+    contacted_count: Mapped[int | None] = mapped_column()            # suppressed: you already contacted this issue
+    too_old_count: Mapped[int | None] = mapped_column()              # GitHub's updated_at is outside the fresh window
+    irrelevant_count: Mapped[int | None] = mapped_column()           # scored by the analyzer but not worth a comment (IGNORE class)
+    same_author_count: Mapped[int | None] = mapped_column()          # eligible, but that author already has a better-ranked issue in the list
+    over_limit_count: Mapped[int | None] = mapped_column()           # eligible, but past the "top N" cut
+    fresh_hours: Mapped[float | None] = mapped_column()              # the freshness window used (None / 0 = no window)
+
+class IssueOutreach(Base):
+    """Permanent per-issue outreach record: 'I commented on this GitHub issue'. One row per issue, identified by issue_key (the lower-cased canonical issue URL).
+    Written only by the manual 'Mark as commented' action; never deleted by scans. Later steps use it to keep contacted issues out of the fresh queue.
+    Re-marking the same issue updates this row (updated_at) and keeps the original contacted_at, so there is never a duplicate."""
+    __tablename__ = "issue_outreach"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    issue_key: Mapped[str] = mapped_column(String(400), unique=True)   # canonical issue URL, lower-cased: the stable identity
+    issue_url: Mapped[str] = mapped_column(String(400))                # canonical URL with GitHub's own casing, for display / links
+    repository: Mapped[str] = mapped_column(String(120), default="")
+    number: Mapped[int | None] = mapped_column()
+    author: Mapped[str] = mapped_column(String(120), default="")
+    post_id: Mapped[int | None] = mapped_column(ForeignKey("post_opportunities.id"))
+    status: Mapped[str] = mapped_column(String(30), default="COMMENTED")
+    contacted_at: Mapped[datetime] = mapped_column(default=now)        # first time you marked it (naive UTC)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+    updated_at: Mapped[datetime] = mapped_column(default=now, onupdate=now)
 
 class FollowUp(Base):
     __tablename__ = "followups"

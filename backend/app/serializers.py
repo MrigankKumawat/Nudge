@@ -160,6 +160,44 @@ def activity_out(a: Activity) -> list:
 def activity_dict(a: Activity) -> dict:
     return dict(id=a.id, type=a.type, actor=a.actor, description=a.description, timestamp=iso(a.timestamp), when=ago(a.timestamp), meta=a.meta or {})
 
+def _hours(h) -> str:
+    return f"{h:g}h"
+
+def _n(n: int, word: str) -> str:
+    return f"{n:,} {word}" + ("" if n == 1 else "s")
+
+def scan_funnel(scan: Scan) -> list[dict] | None:
+    """The seven honest counts, in pipeline order. Every line counts only what survived the line before it, so they add up (see the Scan model).
+    None for a scan saved before the stage counts existed: those numbers were never recorded and are not guessed."""
+    if scan.too_old_count is None: return None
+    h = scan.fresh_hours
+    bots, irr = scan.skipped_bots or 0, scan.irrelevant_count or 0
+    return [
+        dict(key="github_total", label="Results returned by GitHub", count=scan.fetched_count, detail=f"{scan.matching_count:,} match on GitHub; {scan.fetched_count:,} fetched"),
+        dict(key="unique", label="Unique issues after URL deduplication", count=scan.unique_count, detail=f"{scan.duplicate_count or 0} repeated and {scan.skipped_unusable or 0} unusable removed"),
+        dict(key="contacted", label="Already contacted (suppressed)", count=scan.contacted_count or 0, detail="issues you already commented on, found again"),
+        dict(key="too_old", label="Excluded as too old", count=scan.too_old_count, detail=f"GitHub last updated them more than {_hours(h)} ago" if h else "no recency window was applied"),
+        dict(key="bots_irrelevant", label="Excluded as bots or irrelevant", count=bots + irr, detail=f"{bots} bot or deleted accounts, {irr} not worth a comment"),
+        dict(key="eligible", label="Fresh eligible opportunities", count=scan.comment_count, detail="recent, not contacted, human, worth a comment"),
+        dict(key="displayed", label="Final opportunities displayed", count=scan.displayed_count,
+             detail=f"{scan.same_author_count or 0} skipped (author already listed), {scan.hidden_dismissed or 0} dismissed, {scan.over_limit_count or 0} past the top {scan.result_limit}"),
+    ]
+
+def _empty_reason(scan: Scan) -> str | None:
+    """Why nothing is shown. None when the scan produced opportunities (or has not finished)."""
+    if scan.status != "COMPLETED" or scan.displayed_count: return None
+    if not scan.matching_count: return "GitHub found no open issues for this keyword" + (f" updated in the last {_hours(scan.fresh_hours)}." if scan.fresh_hours else ".") + " Try a broader keyword."
+    if scan.too_old_count is None: return "No outreach-worthy issues in this pool. This scan was saved before pipeline counts were tracked, so it cannot say more."
+    if not scan.unique_count: return "GitHub returned results, but none were usable issues (pull requests or incomplete records)."
+    parts = [(scan.contacted_count, "already contacted"), (scan.too_old_count, f"not updated in the last {_hours(scan.fresh_hours)}" if scan.fresh_hours else "too old"),
+             (scan.skipped_bots, "from bots or deleted accounts"), (scan.irrelevant_count, "not worth a comment")]
+    why = ", ".join(f"{n} {t}" for n, t in parts if n)
+    if scan.comment_count:   # something qualified, but every candidate was removed at the last step
+        late = ", ".join(f"{n} {t}" for n, t in ((scan.hidden_dismissed, "dismissed by you"), (scan.same_author_count, "from an author already listed"), (scan.over_limit_count, "past the top-N cut")) if n)
+        return f"{_n(scan.comment_count, 'issue')} qualified, but none are shown: {late or 'all were removed at the last step'}."
+    hint = " Try a broader keyword" + (" or a longer recency window (GITHUB_FRESH_HOURS)." if scan.fresh_hours and scan.too_old_count else ".")
+    return f"No fresh opportunities: all {_n(scan.unique_count, 'unique issue')} {'was' if scan.unique_count == 1 else 'were'} filtered out ({why}).{hint}"
+
 def scan_out(db, scan: Scan, results: bool = True) -> dict:
     """One GitHub scan. The old search response keys (total_count, fetched, analyzed, actionable, shown, hidden_dismissed, warning, authenticated, results)
     are kept as they were, so the Hunter page keeps working; the rest is new. `results` are the scan's opportunities in rank order, read live from
@@ -169,11 +207,16 @@ def scan_out(db, scan: Scan, results: bool = True) -> dict:
     if results and ids:
         by_id = {p.id: p for p in db.scalars(select(PostOpportunity).where(PostOpportunity.id.in_(ids)))}
         posts = [post_out(db, by_id[i]) for i in ids if i in by_id and by_id[i].status not in DISMISSED]
-    return dict(id=scan.id, source=scan.source, keyword=scan.keyword, query=scan.query, status=scan.status.lower(), status_code=scan.status,
+    out = dict(id=scan.id, source=scan.source, keyword=scan.keyword, query=scan.query, status=scan.status.lower(), status_code=scan.status,
                 started_at=iso(scan.started_at), completed_at=iso(scan.completed_at), when=ago(scan.completed_at or scan.started_at), limit=scan.result_limit,
                 total_count=scan.matching_count, fetched=scan.fetched_count, unique=scan.unique_count, analyzed=scan.analyzed_count, actionable=scan.comment_count,
                 shown=scan.displayed_count, hidden_dismissed=scan.hidden_dismissed, pages=scan.pages, skipped_unusable=scan.skipped_unusable, skipped_bots=scan.skipped_bots,
                 incomplete=bool(scan.incomplete), authenticated=bool(scan.authenticated), warning=scan.warning, error=scan.error, result_ids=ids, results=posts)
+    funnel = scan_funnel(scan)   # additive keys: every field above keeps its old name and meaning (except `unique`, now counted before the bot step)
+    out.update(counts_tracked=funnel is not None, funnel=funnel, empty_reason=_empty_reason(scan), fresh_hours=scan.fresh_hours,
+               duplicates=scan.duplicate_count, contacted=scan.contacted_count, too_old=scan.too_old_count, bots=scan.skipped_bots, irrelevant=scan.irrelevant_count,
+               eligible=scan.comment_count, same_author=scan.same_author_count, over_limit=scan.over_limit_count)
+    return out
 
 def current_scan(db, results: bool = True) -> dict | None:
     """The scan the Hunter page shows: the newest COMPLETED one. A running or failed scan never replaces it."""

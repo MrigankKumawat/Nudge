@@ -8,10 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .db import Base, engine, get_db, now, SessionLocal, init_db
-from .models import Lead, PostOpportunity, Draft, Conversation, FollowUp, Activity, AgentRun, DISMISSED
+from .models import Lead, PostOpportunity, Draft, Conversation, FollowUp, Activity, AgentRun, IssueOutreach, DISMISSED
 from . import serializers as S
 from .agent.pipeline import execute_run
-from .agent.github_adapter import GitHubSearchError
+from .agent.github_adapter import GitHubSearchError, canonical_issue_url, issue_key, split_issue_url
 from .agent.github_search import search_and_save, DEFAULT_LIMIT
 
 # Import new sub-routers
@@ -126,6 +126,34 @@ def dismiss_post(id: int, body: DismissBody = DismissBody(), db: Session = Depen
     db.add(Activity(type="post_dismissed", actor="you", description=f"You marked {p.author}'s post as {S.label(body.reason).lower()}", meta={"lead_id": p.lead_id}))
     db.commit()
     return S.post_out(db, p)
+
+@r.post("/posts/{id}/mark-commented")
+def mark_commented(id: int, db: Session = Depends(get_db)):
+    """You commented on this GitHub issue yourself. Records it permanently in issue_outreach (one row per issue, keyed by canonical URL) and moves the
+    post / lead forward to CONTACTED. Local bookkeeping only: nothing is sent to or read from GitHub. Safe to click twice: the existing row is updated, never duplicated."""
+    p = get_or_404(db, PostOpportunity, id)
+    if p.source != "github:issue": raise HTTPException(422, "Mark as commented is only for GitHub issue opportunities")
+    url = canonical_issue_url(p.post_url)
+    sp = split_issue_url(url)
+    rec = db.scalar(select(IssueOutreach).where(IssueOutreach.issue_key == issue_key(url)))
+    first = rec is None
+    if first:
+        rec = IssueOutreach(issue_key=issue_key(url), issue_url=url, contacted_at=now())
+        db.add(rec)
+    rec.repository = (f"{sp[0]}/{sp[1]}" if sp else p.author_company) or ""
+    rec.number, rec.author, rec.post_id, rec.status = (sp[2] if sp else None), p.author, p.id, "COMMENTED"
+    if p.status in ("NEW", "AWAITING_APPROVAL", "APPROVED"): p.status = "CONTACTED"      # never downgrade REPLIED / dismissed etc.
+    lead = db.get(Lead, p.lead_id) if p.lead_id else None
+    if lead is not None:
+        if lead.status in ("NEW", "AWAITING_APPROVAL", "APPROVED"): lead.status = "CONTACTED"
+        lead.last_contacted_at = rec.contacted_at
+    for d in db.scalars(select(Draft).where(Draft.target_type == "post", Draft.target_id == p.id, Draft.status == "AWAITING_APPROVAL")):
+        d.status, d.approved_at = "APPROVED", d.approved_at or now()                    # you posted it, so it leaves the approval queue; the draft text is kept
+    if first:
+        db.add(Activity(type="comment_marked", actor="you", description=f"You marked your comment on {rec.repository}#{rec.number} as posted", meta={"lead_id": p.lead_id, "post_id": p.id, "issue_url": url}))
+    db.commit()
+    return dict(issue_url=rec.issue_url, repository=rec.repository, number=rec.number, author=rec.author, status=rec.status,
+                contacted_at=S.iso(rec.contacted_at), already_marked=not first, post=S.post_out(db, p))
 
 # ---------- approval queue ----------
 @r.get("/queue")
