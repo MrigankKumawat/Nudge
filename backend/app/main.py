@@ -239,12 +239,13 @@ def trigger_run(bg: BackgroundTasks, source: Literal["linkedin", "github", "all"
 class GithubSearchBody(BaseModel):
     keyword: str = Field(min_length=1, max_length=300)
     limit: int = Field(DEFAULT_LIMIT, ge=1, le=50)
+    fresh_hours: float | None = Field(None, ge=0, le=24 * 365)   # recency window in hours. None = the server default (GITHUB_FRESH_HOURS, 48). 0 = no window (historical research)
 
 @r.post("/github/search")
 def github_search(body: GithubSearchBody, db: Session = Depends(get_db)):
     """keyword -> GitHub search (~500 issue pool) -> existing analyzer -> rank -> save/return the top `limit`. Synchronous: takes a few seconds."""
     try:
-        return search_and_save(db, body.keyword, body.limit)
+        return search_and_save(db, body.keyword, body.limit, fresh_hours=body.fresh_hours)
     except GitHubSearchError as e:
         raise HTTPException(e.status_code, str(e))
 

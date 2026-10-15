@@ -88,6 +88,7 @@ def _save(db: Session, issue: GitHubIssue, an: Analysis, cand, existing: PostOpp
     else:   # saved earlier as IGNORE (no draft, still NEW): it now qualifies, so complete it
         post = existing
         post.relevance_score, post.reasons, post.why, post.recommended_action, post.status = an.score, list(an.signals), an.why, "COMMENT", "AWAITING_APPROVAL"
+        post.posted_at = _naive_utc(issue.updated_at)
     db.add(Activity(type="scored", actor="agent", description=f"Agent scored {cand.name} {an.score}/100", meta={"lead_id": lead.id, "score": an.score}))
     db.add(Draft(lead_id=lead.id, target_type="post", target_id=post.id, action_type="COMMENT", content=github_comment_text(cand), why=an.why, status="AWAITING_APPROVAL"))
     db.add(Activity(type="draft_generated", actor="agent", description=f"Agent generated comment draft for {cand.name}", meta={"lead_id": lead.id}))
@@ -154,9 +155,11 @@ def search_and_save(db: Session, keyword: str, limit: int = DEFAULT_LIMIT, adapt
             old = existing.get(issue_key(issue.url))
             if old is not None and old.status in DISMISSED:
                 hidden += 1; continue                                                       # you already dismissed this one
+            if old is not None: old.posted_at = max(old.posted_at, _naive_utc(issue.updated_at))   # show GitHub's CURRENT updated time, not the moment Nudge first saved the issue
             authors.add(issue.author_url)
             if old is not None and (old.status != "NEW" or _has_draft(db, old.id)):
-                picked.append(old); continue                                                # already worked or drafted: surface it exactly as it is, no duplicate, no reset
+                old.posted_at = max(old.posted_at, _naive_utc(issue.updated_at))            # only the timestamp moves to GitHub's current updated_at, so the card never shows a stale "updated" time
+                picked.append(old); continue                                                # already worked or drafted: surface it as it is, no duplicate, no reset of status / draft / notes
             picked.append(_save(db, issue, an, to_candidate(issue, an, now), old))
         authed = bool((adapter._token if adapter._token is not None else os.getenv("GITHUB_TOKEN", "")).strip())
         scan = db.get(Scan, scan_id)                                                        # fill the scan and flip it to COMPLETED in the SAME transaction as the saves above

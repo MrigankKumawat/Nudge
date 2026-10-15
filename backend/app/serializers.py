@@ -65,7 +65,7 @@ def latest_draft(db, target_type: str, target_id: int) -> Draft | None:
 def post_out(db, p: PostOpportunity) -> dict:
     out = dict(id=p.id, lead_id=p.lead_id, url=re.sub(r"^https?://", "", p.post_url), post_url=p.post_url, who=p.author,
                 role=" · ".join(x for x in (p.author_role, p.author_company) if x), score=p.relevance_score, when=ago(p.posted_at),
-                posted_at=p.posted_at.isoformat(), txt=p.content, why=p.why, sig=p.reasons, act=ACT[p.recommended_action],
+                posted_at=iso(p.posted_at), txt=p.content, why=p.why, sig=p.reasons, act=ACT[p.recommended_action],
                 status=label(p.status), draft=post_draft(db, p), source=p.source, github=None, draft_status=None, draft_id=None)
     if p.source == GH_SOURCE:   # additive: a GitHub draft stays visible (and copyable) after approve/reject, with its state
         d = latest_draft(db, "post", p.id)
@@ -252,7 +252,7 @@ def stats(db) -> dict:
     return dict(
         new_leads=db.scalar(select(func.count()).select_from(Lead).where(Lead.status.in_(("NEW", "AWAITING_APPROVAL")), Lead.recommended_action != "IGNORE")) or 0,
         new_leads_24h=db.scalar(select(func.count()).select_from(Lead).where(Lead.created_at >= now() - timedelta(days=1), live(Lead.status))) or 0,
-        post_opportunities=db.scalar(select(func.count()).select_from(PostOpportunity).where(PostOpportunity.posted_at >= week, live(PostOpportunity.status))) or 0,
+        post_opportunities=db.scalar(select(func.count()).select_from(PostOpportunity).where(PostOpportunity.posted_at >= week, live(PostOpportunity.status), PostOpportunity.status != "CONTACTED")) or 0,   # contacted issues are history, not opportunities
         awaiting_approval=len(queue(db)), followups=len(open_fu), overdue=sum(1 for f in open_fu if f.due_at < now()),
         conversations=db.scalar(select(func.count()).select_from(Conversation)) or 0, unread_conversations=unread_count(db))
 
